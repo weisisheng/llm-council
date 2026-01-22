@@ -25,7 +25,8 @@
 13. [Security Requirements](#13-security-requirements)
 14. [Migration Plan](#14-migration-plan)
 15. [Risks & Mitigations](#15-risks--mitigations)
-16. [Appendix](#16-appendix)
+16. [RAG System (Future)](#16-rag-system-future)
+17. [Appendix](#17-appendix)
 
 ---
 
@@ -1125,7 +1126,310 @@ async function migrate(db: D1Database) {
 
 ---
 
-## 16. Appendix
+## 16. RAG System (Future)
+
+> **Status**: Planned for v2.1+
+> **Priority**: P2 (after auth, testing, and feature flags)
+
+### 16.1 Overview
+
+Implement a Retrieval-Augmented Generation (RAG) system to enable semantic search across:
+- **Conversations**: Find past council deliberations by topic
+- **Queries**: Search user questions for patterns and reuse
+- **Notes**: Search admin annotations and conversation notes
+- **Council Responses**: Search synthesized answers for knowledge retrieval
+
+### 16.2 Architecture: Cloudflare-Native Stack
+
+Leverage Cloudflare's integrated AI platform for minimal cost and latency:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Council of Elrond                            │
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
+│  │   D1 (SQL)   │    │  Vectorize   │    │   Workers AI     │  │
+│  │              │    │  (Vectors)   │    │  (Embeddings)    │  │
+│  │ conversations│◄──►│              │◄──►│                  │  │
+│  │ messages     │    │ conv_vectors │    │ @cf/baai/bge-m3  │  │
+│  │ notes        │    │ query_vectors│    │                  │  │
+│  └──────────────┘    └──────────────┘    └──────────────────┘  │
+│         │                   │                     │             │
+│         └───────────────────┼─────────────────────┘             │
+│                             │                                   │
+│                    ┌────────▼────────┐                          │
+│                    │   RAG Service   │                          │
+│                    │                 │                          │
+│                    │ - Index on save │                          │
+│                    │ - Search API    │                          │
+│                    │ - Rerank results│                          │
+│                    └─────────────────┘                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 16.3 Recommended Stack
+
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| **Vector DB** | Cloudflare Vectorize | Native integration, $0-6/mo for typical usage |
+| **Embeddings** | Workers AI: `@cf/baai/bge-m3` | Multi-lingual, 1024-dim, $0.012/M tokens |
+| **Reranking** | Workers AI: `@cf/baai/bge-reranker-base` | Improves retrieval accuracy |
+| **Storage** | D1 (existing) | Document metadata, full-text backup |
+
+### 16.4 Cost Analysis
+
+**Cloudflare Vectorize Pricing:**
+
+| Tier | Queried Dimensions | Stored Dimensions | Monthly Cost |
+|------|-------------------|-------------------|--------------|
+| Free | 30M included | 5M included | $0.00 |
+| Paid | 50M included, then $0.01/M | 10M included, then $0.05/100M | ~$0.50-6.00 |
+
+**Estimated Costs for Council of Elrond:**
+
+| Scenario | Vectors | Queries/mo | Est. Cost |
+|----------|---------|------------|-----------|
+| Small (100 conversations) | 1,000 | 500 | **Free** |
+| Medium (1,000 conversations) | 10,000 | 5,000 | **$0.10** |
+| Large (10,000 conversations) | 100,000 | 50,000 | **$1.50** |
+| Enterprise (100,000 conversations) | 1,000,000 | 500,000 | **$15.00** |
+
+**Workers AI Embedding Costs:**
+
+| Model | Cost/M Tokens | Neurons/Call | Notes |
+|-------|---------------|--------------|-------|
+| `bge-m3` | $0.012 | 1,075 | Best value, multi-lingual |
+| `bge-base-en-v1.5` | $0.067 | 6,058 | English-only, 768-dim |
+| `bge-large-en-v1.5` | $0.204 | 18,582 | Highest quality |
+
+**Free Tier**: 10,000 Neurons/day = ~9 `bge-m3` calls or ~1.6 `bge-base` calls
+
+### 16.5 Database Schema
+
+```sql
+-- migrations/0004_vectorize_metadata.sql
+
+-- Track what's been indexed
+CREATE TABLE vector_index_status (
+  id TEXT PRIMARY KEY,
+  entity_type TEXT NOT NULL,  -- 'conversation' | 'message' | 'note'
+  entity_id TEXT NOT NULL,
+  vector_id TEXT NOT NULL,    -- Vectorize vector ID
+  indexed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  content_hash TEXT NOT NULL, -- Detect changes for re-indexing
+  UNIQUE(entity_type, entity_id)
+);
+
+CREATE INDEX idx_vector_entity ON vector_index_status(entity_type, entity_id);
+```
+
+### 16.6 Vectorize Index Schema
+
+```typescript
+// Create indexes via Wrangler CLI
+// wrangler vectorize create council-conversations --dimensions=1024 --metric=cosine
+
+interface ConversationVector {
+  id: string;           // conversation_id
+  values: number[];     // 1024-dim embedding from bge-m3
+  metadata: {
+    title: string;
+    user_id: string;
+    created_at: string;
+    message_count: number;
+    has_notes: boolean;
+  };
+}
+
+interface MessageVector {
+  id: string;           // message_id
+  values: number[];
+  metadata: {
+    conversation_id: string;
+    role: 'user' | 'assistant';
+    stage: 'query' | 'stage1' | 'stage2' | 'stage3';
+    model?: string;     // For assistant messages
+  };
+}
+```
+
+### 16.7 RAG Service Implementation
+
+```typescript
+// backend/src/services/rag.ts
+
+import { Ai } from '@cloudflare/ai';
+
+interface Env {
+  AI: Ai;
+  VECTORIZE: VectorizeIndex;
+  DB: D1Database;
+}
+
+export class RAGService {
+  constructor(private env: Env) {}
+
+  /**
+   * Generate embedding for text using Workers AI
+   */
+  async embed(text: string): Promise<number[]> {
+    const response = await this.env.AI.run('@cf/baai/bge-m3', {
+      text: [text],
+    });
+    return response.data[0];
+  }
+
+  /**
+   * Index a conversation (title + synthesis)
+   */
+  async indexConversation(conversationId: string): Promise<void> {
+    const conv = await this.getConversationContent(conversationId);
+    const embedding = await this.embed(conv.searchableText);
+
+    await this.env.VECTORIZE.upsert([{
+      id: conversationId,
+      values: embedding,
+      metadata: {
+        title: conv.title,
+        user_id: conv.user_id,
+        created_at: conv.created_at,
+        type: 'conversation',
+      },
+    }]);
+  }
+
+  /**
+   * Semantic search across conversations
+   */
+  async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
+    const queryEmbedding = await this.embed(query);
+
+    const results = await this.env.VECTORIZE.query(queryEmbedding, {
+      topK: options.limit || 10,
+      filter: options.filter,
+      returnMetadata: true,
+    });
+
+    // Optional: Rerank for better accuracy
+    if (options.rerank) {
+      return this.rerank(query, results);
+    }
+
+    return results.matches.map(m => ({
+      id: m.id,
+      score: m.score,
+      metadata: m.metadata,
+    }));
+  }
+
+  /**
+   * Rerank results using bge-reranker
+   */
+  async rerank(query: string, results: VectorizeMatch[]): Promise<SearchResult[]> {
+    const pairs = results.matches.map(m => ({
+      query,
+      context: m.metadata?.title || '',
+    }));
+
+    const scores = await this.env.AI.run('@cf/baai/bge-reranker-base', {
+      pairs,
+    });
+
+    return results.matches
+      .map((m, i) => ({ ...m, score: scores[i] }))
+      .sort((a, b) => b.score - a.score);
+  }
+}
+```
+
+### 16.8 API Endpoints
+
+```typescript
+// New RAG endpoints
+
+// Search conversations semantically
+GET /api/search?q=machine+learning&limit=10
+Response: { results: [{ id, title, score, snippet }] }
+
+// Search within a conversation
+GET /api/conversations/:id/search?q=neural+networks
+Response: { results: [{ message_id, stage, score, snippet }] }
+
+// Find similar conversations
+GET /api/conversations/:id/similar?limit=5
+Response: { results: [{ id, title, score }] }
+
+// Admin: Reindex all content
+POST /api/admin/reindex
+Response: { indexed: 1523, errors: 0 }
+```
+
+### 16.9 User Stories
+
+| ID | Story | Priority |
+|----|-------|----------|
+| US-40 | As a user, I can search my past conversations by topic | P1 |
+| US-41 | As a user, I can find similar past queries before asking | P1 |
+| US-42 | As a user, I can see related conversations while chatting | P2 |
+| US-43 | As an admin, I can search all conversations across users | P1 |
+| US-44 | As an admin, I can find conversations by notes content | P2 |
+
+### 16.10 Alternative: Hybrid Search
+
+For improved accuracy, consider hybrid search combining:
+
+1. **Semantic (Vector)**: Conceptual similarity via embeddings
+2. **Lexical (FTS)**: Exact keyword matching via D1 FTS5
+
+```sql
+-- D1 Full-Text Search (supplement to Vectorize)
+CREATE VIRTUAL TABLE conversations_fts USING fts5(
+  title,
+  content,
+  content='conversations',
+  content_rowid='rowid'
+);
+
+-- Hybrid query: combine vector + FTS scores
+```
+
+### 16.11 Open Source Embedding Alternatives
+
+If Workers AI costs become a concern, consider self-hosted alternatives:
+
+| Model | Dimensions | Performance | Hosting |
+|-------|------------|-------------|---------|
+| `e5-small-v2` | 384 | 100% Top-5 accuracy | CPU-friendly |
+| `nomic-embed-text-v1.5` | 768 | 71% accuracy | Apache 2.0 |
+| `bge-m3` | 1024 | MTEB leader | Multi-lingual |
+
+These can be deployed on:
+- Cloudflare Workers (via ONNX runtime)
+- Dedicated inference server
+- HuggingFace Inference Endpoints
+
+### 16.12 Implementation Phases
+
+**Phase 1: Foundation**
+- [ ] Create Vectorize index
+- [ ] Add `vector_index_status` migration
+- [ ] Implement RAGService with embed/search
+- [ ] Index on conversation create/update
+
+**Phase 2: Search UI**
+- [ ] Add search bar to sidebar
+- [ ] Display search results with snippets
+- [ ] "Similar conversations" sidebar widget
+
+**Phase 3: Advanced Features**
+- [ ] Hybrid search (vector + FTS)
+- [ ] Reranking for improved accuracy
+- [ ] Conversation clustering/topics
+- [ ] "Before you ask" similar query suggestions
+
+---
+
+## 17. Appendix
 
 ### A. Environment Variables
 
@@ -1188,3 +1492,4 @@ ENVIRONMENT=production|staging|development
 |---------|------|--------|---------|
 | 1.0 | Jan 2026 | Claude | Initial PRD |
 | 1.1 | Jan 2026 | Claude | Updated frontend to Astro + Preact islands (Cloudflare acquisition) |
+| 1.2 | Jan 2026 | Claude | Added Section 16: RAG System (Future) with Cloudflare Vectorize + Workers AI |
