@@ -1168,52 +1168,32 @@ Leverage Cloudflare's integrated AI platform for minimal cost and latency:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 16.3 Recommended Stack
+### 16.3 Recommended Stack: Cloudflare-Native
 
-#### Primary Option: Supabase pgvector (Recommended)
-
-Given existing Supabase usage, this is the most cost-effective and integrated solution.
+Given data already resides in Cloudflare D1, use Cloudflare Vectorize + Workers AI for minimal latency and single-platform simplicity.
 
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
-| **Vector DB** | Supabase pgvector | Already using Supabase, ~$10/mo additional |
-| **Embeddings** | OpenAI text-embedding-3-small | $0.02/M tokens, best quality/cost |
-| **Hybrid Search** | Native PostgreSQL FTS + vector | Single query, no separate DB |
-| **Storage** | Supabase (existing) | Row-level security, SQL JOINs |
+| **Vector DB** | Cloudflare Vectorize | Same edge as D1, ~$0-6/mo |
+| **Embeddings** | Workers AI: `@cf/baai/bge-m3` | 1024-dim, $0.012/M tokens |
+| **Reranking** | Workers AI: `@cf/baai/bge-reranker-base` | Optional accuracy boost |
+| **Storage** | D1 (existing) | Full conversation data |
 
-**Advantages over Cloudflare Vectorize:**
-- Hybrid search (vector + full-text) in single query
-- No 5M vector limit
-- SQL familiarity and debugging
-- User data isolation via RLS
-- No vendor lock-in
+**Why this works for Council of Elrond:**
+- Expected scale: <50K conversations (well under 5M vector limit)
+- Single conversation indexing (not bulk imports)
+- Vector-only search sufficient for conversation lookup
+- Same-edge latency (~50ms vs ~150ms cross-platform)
 
-#### Alternative: Cloudflare-Native Stack
+**Known limitations** (acceptable for this use case):
+- No native hybrid search (workaround: parallel vector + D1 LIKE queries)
+- 5M vector cap per index (sufficient for expected scale)
 
-If preferring edge-first architecture (note: has limitations, see [research notes](./vector-search-research.md)):
-
-| Component | Choice | Rationale |
-|-----------|--------|-----------|
-| **Vector DB** | Cloudflare Vectorize | Native integration, $0-6/mo for typical usage |
-| **Embeddings** | Workers AI: `@cf/baai/bge-m3` | Multi-lingual, 1024-dim, $0.012/M tokens |
-| **Reranking** | Workers AI: `@cf/baai/bge-reranker-base` | Improves retrieval accuracy |
-| **Storage** | D1 (existing) | Document metadata, full-text backup |
-
-**Known limitations:** No hybrid search, 5M vector cap, slow bulk inserts, sub-200ms latency difficult.
+See [vector-search-research.md](./vector-search-research.md) for alternative options (Supabase pgvector, Qdrant).
 
 ### 16.4 Cost Analysis
 
-**Supabase pgvector (Recommended):**
-
-| Component | Cost | Notes |
-|-----------|------|-------|
-| Supabase Pro (existing) | $25/mo | Already paying |
-| Vector storage | $0 | Included in existing storage |
-| Additional compute | ~$10/mo | For embedding queries |
-| OpenAI embeddings | ~$2/mo | 100K tokens @ $0.02/M |
-| **Total additional** | **~$10-12/mo** | |
-
-**Cloudflare Vectorize Pricing:**
+**Cloudflare-Native (Primary):**
 
 | Tier | Queried Dimensions | Stored Dimensions | Monthly Cost |
 |------|-------------------|-------------------|--------------|
@@ -1443,24 +1423,335 @@ These can be deployed on:
 - Dedicated inference server
 - HuggingFace Inference Endpoints
 
-### 16.12 Implementation Phases
+### 16.12 Cloudflare Implementation Details
+
+#### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         CLOUDFLARE EDGE                              │
+│                                                                      │
+│  ┌──────────────┐    ┌──────────────┐    ┌────────────────────────┐ │
+│  │   Workers    │    │     D1       │    │      Workers AI        │ │
+│  │   (Hono)     │    │   (SQLite)   │    │    @cf/baai/bge-m3     │ │
+│  └──────┬───────┘    └──────┬───────┘    └───────────┬────────────┘ │
+│         │                   │                        │              │
+│         │                   │                        │              │
+│         │            ┌──────┴───────┐                │              │
+│         │            │  Vectorize   │◄───────────────┘              │
+│         │            │  (1024-dim)  │   embed query                 │
+│         │            └──────┬───────┘                               │
+│         │                   │                                       │
+│         ▼                   ▼                                       │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                      SEARCH FLOW                              │  │
+│  │                                                               │  │
+│  │  1. User: "machine learning strategies"                       │  │
+│  │  2. Workers AI: embed → [0.12, -0.34, 0.56, ...]             │  │
+│  │  3. Vectorize: query → [conv_1 (0.92), conv_5 (0.87), ...]   │  │
+│  │  4. D1: SELECT * FROM conversations WHERE id IN (...)        │  │
+│  │  5. Return: merged results with scores                        │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                      INDEX FLOW (on save)                     │  │
+│  │                                                               │  │
+│  │  1. Conversation saved to D1                                  │  │
+│  │  2. Extract: title + notes + stage3 synthesis                 │  │
+│  │  3. Workers AI: embed → [1024-dim vector]                     │  │
+│  │  4. Vectorize: upsert(conversation_id, vector, metadata)      │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Step 1: Wrangler Configuration
+
+```toml
+# wrangler.toml - add these bindings
+
+# Workers AI for embeddings
+[ai]
+binding = "AI"
+
+# Vectorize for vector storage
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "council-search"
+```
+
+#### Step 2: Create Vectorize Index
+
+```bash
+# Create the index (run once)
+wrangler vectorize create council-search --dimensions=1024 --metric=cosine
+
+# Verify
+wrangler vectorize list
+```
+
+#### Step 3: Search Service Implementation
+
+```typescript
+// backend/src/services/search.ts
+
+interface Env {
+  DB: D1Database;
+  VECTORIZE: VectorizeIndex;
+  AI: Ai;
+}
+
+interface SearchResult {
+  id: string;
+  title: string;
+  score: number;
+  snippet?: string;
+  updated_at: string;
+}
+
+/**
+ * Search conversations semantically
+ */
+export async function searchConversations(
+  env: Env,
+  query: string,
+  options: { limit?: number; userId?: string } = {}
+): Promise<SearchResult[]> {
+  const { limit = 10, userId } = options;
+
+  // 1. Generate embedding for search query
+  const embeddingResponse = await env.AI.run('@cf/baai/bge-m3', {
+    text: [query],
+  });
+  const queryVector = embeddingResponse.data[0];
+
+  // 2. Find similar vectors in Vectorize
+  const vectorResults = await env.VECTORIZE.query(queryVector, {
+    topK: limit,
+    returnMetadata: true,
+    filter: userId ? { user_id: userId } : undefined,
+  });
+
+  if (vectorResults.matches.length === 0) {
+    return [];
+  }
+
+  // 3. Get full conversation data from D1
+  const ids = vectorResults.matches.map(m => m.id);
+  const placeholders = ids.map(() => '?').join(',');
+
+  const conversations = await env.DB.prepare(`
+    SELECT c.id, c.title, c.updated_at, c.notes,
+           (SELECT content FROM messages
+            WHERE conversation_id = c.id AND role = 'user'
+            ORDER BY created_at DESC LIMIT 1) as last_query
+    FROM conversations c
+    WHERE c.id IN (${placeholders})
+  `).bind(...ids).all();
+
+  // 4. Merge scores with conversation data
+  const convMap = new Map(
+    conversations.results.map((c: any) => [c.id, c])
+  );
+
+  return vectorResults.matches.map(match => {
+    const conv = convMap.get(match.id);
+    return {
+      id: match.id,
+      title: conv?.title || 'Untitled',
+      score: match.score,
+      snippet: conv?.last_query?.substring(0, 150) || conv?.notes?.substring(0, 150),
+      updated_at: conv?.updated_at,
+    };
+  });
+}
+
+/**
+ * Index a conversation for search
+ */
+export async function indexConversation(
+  env: Env,
+  conversationId: string
+): Promise<void> {
+  // 1. Get conversation content
+  const result = await env.DB.prepare(`
+    SELECT
+      c.id, c.title, c.notes, c.user_id,
+      (SELECT content FROM messages
+       WHERE conversation_id = c.id AND role = 'assistant'
+       ORDER BY created_at DESC LIMIT 1) as synthesis
+    FROM conversations c
+    WHERE c.id = ?
+  `).bind(conversationId).first();
+
+  if (!result) return;
+
+  // 2. Build searchable text (limit to ~6000 chars for token limits)
+  const searchableText = [
+    result.title,
+    result.notes,
+    result.synthesis?.substring(0, 5000),
+  ].filter(Boolean).join('\n\n');
+
+  if (!searchableText.trim()) return;
+
+  // 3. Generate embedding
+  const embeddingResponse = await env.AI.run('@cf/baai/bge-m3', {
+    text: [searchableText],
+  });
+
+  // 4. Upsert to Vectorize
+  await env.VECTORIZE.upsert([{
+    id: conversationId,
+    values: embeddingResponse.data[0],
+    metadata: {
+      title: result.title || 'Untitled',
+      user_id: result.user_id,
+      indexed_at: new Date().toISOString(),
+    },
+  }]);
+}
+
+/**
+ * Remove conversation from search index
+ */
+export async function removeFromIndex(
+  env: Env,
+  conversationId: string
+): Promise<void> {
+  await env.VECTORIZE.deleteByIds([conversationId]);
+}
+```
+
+#### Step 4: API Routes
+
+```typescript
+// backend/src/routes/search.ts
+
+import { Hono } from 'hono';
+import { searchConversations } from '../services/search';
+
+const app = new Hono<{ Bindings: Env }>();
+
+// GET /api/search?q=machine+learning&limit=10
+app.get('/search', async (c) => {
+  const query = c.req.query('q');
+  const limit = parseInt(c.req.query('limit') || '10');
+
+  if (!query || query.length < 2) {
+    return c.json({ error: 'Query must be at least 2 characters' }, 400);
+  }
+
+  const results = await searchConversations(c.env, query, { limit });
+  return c.json({ results });
+});
+
+// GET /api/conversations/:id/similar?limit=5
+app.get('/conversations/:id/similar', async (c) => {
+  const conversationId = c.req.param('id');
+  const limit = parseInt(c.req.query('limit') || '5');
+
+  // Get the conversation's vector and find similar
+  const conv = await c.env.DB.prepare(
+    'SELECT title FROM conversations WHERE id = ?'
+  ).bind(conversationId).first();
+
+  if (!conv) {
+    return c.json({ error: 'Conversation not found' }, 404);
+  }
+
+  // Search using conversation title as query
+  const results = await searchConversations(c.env, conv.title, { limit: limit + 1 });
+
+  // Exclude the current conversation
+  const filtered = results.filter(r => r.id !== conversationId).slice(0, limit);
+  return c.json({ results: filtered });
+});
+
+export default app;
+```
+
+#### Step 5: Hook into Conversation Save
+
+```typescript
+// In storage.ts or conversations route, after saving:
+
+import { indexConversation, removeFromIndex } from './search';
+
+// After creating/updating conversation with assistant response:
+await indexConversation(env, conversationId);
+
+// After deleting conversation:
+await removeFromIndex(env, conversationId);
+```
+
+#### Hybrid Search Workaround
+
+For keyword + semantic search without native hybrid support:
+
+```typescript
+async function hybridSearch(
+  env: Env,
+  query: string,
+  limit = 10
+): Promise<SearchResult[]> {
+  // Run both searches in parallel
+  const [vectorResults, keywordResults] = await Promise.all([
+    // Semantic search
+    searchConversations(env, query, { limit }),
+
+    // Keyword search via D1 LIKE
+    env.DB.prepare(`
+      SELECT id, title, updated_at,
+             0.5 as score  -- fixed score for keyword matches
+      FROM conversations
+      WHERE title LIKE ? OR notes LIKE ?
+      LIMIT ?
+    `).bind(`%${query}%`, `%${query}%`, limit).all(),
+  ]);
+
+  // Merge and deduplicate, preferring vector scores
+  const seen = new Set<string>();
+  const merged: SearchResult[] = [];
+
+  for (const r of vectorResults) {
+    seen.add(r.id);
+    merged.push(r);
+  }
+
+  for (const r of keywordResults.results as any[]) {
+    if (!seen.has(r.id)) {
+      merged.push({
+        id: r.id,
+        title: r.title,
+        score: r.score,
+        updated_at: r.updated_at,
+      });
+    }
+  }
+
+  return merged.sort((a, b) => b.score - a.score).slice(0, limit);
+}
+```
+
+### 16.13 Implementation Phases
 
 **Phase 1: Foundation**
-- [ ] Create Vectorize index
-- [ ] Add `vector_index_status` migration
-- [ ] Implement RAGService with embed/search
-- [ ] Index on conversation create/update
+- [ ] Add AI and Vectorize bindings to wrangler.toml
+- [ ] Create Vectorize index via CLI
+- [ ] Implement search service (embed, search, index)
+- [ ] Add search API routes
+- [ ] Hook indexConversation into conversation save flow
 
 **Phase 2: Search UI**
 - [ ] Add search bar to sidebar
-- [ ] Display search results with snippets
-- [ ] "Similar conversations" sidebar widget
+- [ ] Display search results with snippets and scores
+- [ ] "Similar conversations" widget on conversation view
 
 **Phase 3: Advanced Features**
-- [ ] Hybrid search (vector + FTS)
-- [ ] Reranking for improved accuracy
-- [ ] Conversation clustering/topics
-- [ ] "Before you ask" similar query suggestions
+- [ ] Hybrid search (vector + D1 LIKE)
+- [ ] Reranking with bge-reranker-base
+- [ ] Batch reindex script for existing conversations
+- [ ] Search analytics (popular queries, zero-result queries)
 
 ---
 
@@ -1529,3 +1820,4 @@ ENVIRONMENT=production|staging|development
 | 1.1 | Jan 2026 | Claude | Updated frontend to Astro + Preact islands (Cloudflare acquisition) |
 | 1.2 | Jan 2026 | Claude | Added Section 16: RAG System (Future) with Cloudflare Vectorize + Workers AI |
 | 1.3 | Jan 2026 | Claude | Updated RAG section: Supabase pgvector as primary recommendation (~$10/mo) |
+| 1.4 | Jan 2026 | Claude | Revised to Cloudflare-native RAG; added full implementation details (Section 16.12) |
