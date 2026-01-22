@@ -1130,6 +1130,7 @@ async function migrate(db: D1Database) {
 
 > **Status**: Planned for v2.1+
 > **Priority**: P2 (after auth, testing, and feature flags)
+> **See also**: [Vector Search Research](./vector-search-research.md) for detailed analysis
 
 ### 16.1 Overview
 
@@ -1169,6 +1170,28 @@ Leverage Cloudflare's integrated AI platform for minimal cost and latency:
 
 ### 16.3 Recommended Stack
 
+#### Primary Option: Supabase pgvector (Recommended)
+
+Given existing Supabase usage, this is the most cost-effective and integrated solution.
+
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| **Vector DB** | Supabase pgvector | Already using Supabase, ~$10/mo additional |
+| **Embeddings** | OpenAI text-embedding-3-small | $0.02/M tokens, best quality/cost |
+| **Hybrid Search** | Native PostgreSQL FTS + vector | Single query, no separate DB |
+| **Storage** | Supabase (existing) | Row-level security, SQL JOINs |
+
+**Advantages over Cloudflare Vectorize:**
+- Hybrid search (vector + full-text) in single query
+- No 5M vector limit
+- SQL familiarity and debugging
+- User data isolation via RLS
+- No vendor lock-in
+
+#### Alternative: Cloudflare-Native Stack
+
+If preferring edge-first architecture (note: has limitations, see [research notes](./vector-search-research.md)):
+
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
 | **Vector DB** | Cloudflare Vectorize | Native integration, $0-6/mo for typical usage |
@@ -1176,7 +1199,19 @@ Leverage Cloudflare's integrated AI platform for minimal cost and latency:
 | **Reranking** | Workers AI: `@cf/baai/bge-reranker-base` | Improves retrieval accuracy |
 | **Storage** | D1 (existing) | Document metadata, full-text backup |
 
+**Known limitations:** No hybrid search, 5M vector cap, slow bulk inserts, sub-200ms latency difficult.
+
 ### 16.4 Cost Analysis
+
+**Supabase pgvector (Recommended):**
+
+| Component | Cost | Notes |
+|-----------|------|-------|
+| Supabase Pro (existing) | $25/mo | Already paying |
+| Vector storage | $0 | Included in existing storage |
+| Additional compute | ~$10/mo | For embedding queries |
+| OpenAI embeddings | ~$2/mo | 100K tokens @ $0.02/M |
+| **Total additional** | **~$10-12/mo** | |
 
 **Cloudflare Vectorize Pricing:**
 
@@ -1493,3 +1528,4 @@ ENVIRONMENT=production|staging|development
 | 1.0 | Jan 2026 | Claude | Initial PRD |
 | 1.1 | Jan 2026 | Claude | Updated frontend to Astro + Preact islands (Cloudflare acquisition) |
 | 1.2 | Jan 2026 | Claude | Added Section 16: RAG System (Future) with Cloudflare Vectorize + Workers AI |
+| 1.3 | Jan 2026 | Claude | Updated RAG section: Supabase pgvector as primary recommendation (~$10/mo) |
